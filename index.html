@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>接住流星 - Catch the Stars</title>
+<style>
+  :root { --bg1:#07111a; --bg2:#04131a; --accent:#1f8fff; --ufo:#2aa8be; --gold:gold; }
+  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background:linear-gradient(var(--bg1),var(--bg2)); color:#fff; -webkit-tap-highlight-color:transparent;}
+  .wrap{height:100%;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;}
+  .game-card{position:relative;width:100%;max-width:420px;border-radius:12px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,0.6);background:linear-gradient(180deg, rgba(8,16,28,0.6), rgba(2,6,12,0.8));}
+  canvas{display:block;width:100%;height:auto;background:transparent;touch-action:none;}
+  .hud{position:absolute;left:12px;top:10px;font-size:16px;color:#cfefff;z-index:20}
+  .hud.right{left:auto;right:12px}
+  .hearts{color:#ff6b6b}
+  .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:30;background:rgba(0,0,0,0.45)}
+  .menu{background:rgba(4,10,14,0.92);padding:16px;border-radius:10px;text-align:center;color:#e6f7ff;width:86%;max-width:320px}
+  .title{font-size:20px;margin-bottom:8px}
+  .desc{font-size:13px;color:#bcd9ea;margin-bottom:12px}
+  .btn{background:var(--accent);color:white;border:none;padding:10px 14px;border-radius:8px;font-size:16px;cursor:pointer}
+  .small{font-size:12px;color:#9fbecd;margin-top:8px}
+  .footer-hint{position:absolute;left:10px;bottom:8px;color:rgba(255,255,255,0.06);font-size:12px;z-index:10}
+  @media (orientation:landscape){
+    .game-card{max-width:720px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="game-card" id="gameCard" style="width:360px;">
+    <canvas id="canvas"></canvas>
+
+    <div class="hud" id="hudScore">分数: 0</div>
+    <div class="hud right" id="hudRight" style="right:12px">生命: <span class="hearts" id="hearts">♥♥♥</span></div>
+
+    <div class="footer-hint">触摸或鼠标移动飞碟，接住下落的流星</div>
+
+    <div class="overlay" id="overlay">
+      <div class="menu" id="menu">
+        <div class="title" id="menuTitle">接住流星</div>
+        <div class="desc" id="menuDesc">触摸或用鼠标移动底部的飞碟去接住下落的流星。漏掉会掉生命，生命耗尽游戏结束。</div>
+        <div style="margin-top:8px">
+          <button class="btn" id="startBtn">开始游戏</button>
+        </div>
+        <div class="small" id="highScoreText" style="margin-top:10px">最高分: 0</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // Config
+  const DESIGN_W = 360;
+  const DESIGN_H = 640;
+  const HIGH_SCORE_KEY = 'catch_stars_highscore_v1';
+
+  // Elements
+  const canvas = document.getElementById('canvas');
+  const hudScore = document.getElementById('hudScore');
+  const heartsEl = document.getElementById('hearts');
+  const overlay = document.getElementById('overlay');
+  const startBtn = document.getElementById('startBtn');
+  const highScoreText = document.getElementById('highScoreText');
+  const menuTitle = document.getElementById('menuTitle');
+  const menuDesc = document.getElementById('menuDesc');
+
+  // Canvas sizing and HiDPI
+  function sizeCanvas() {
+    const card = document.getElementById('gameCard');
+    const widthCss = Math.min(window.innerWidth - 24, 420); // keep margin
+    const scale = widthCss / DESIGN_W;
+    const heightCss = Math.round(DESIGN_H * scale);
+    card.style.width = widthCss + 'px';
+    canvas.style.width = widthCss + 'px';
+    canvas.style.height = heightCss + 'px';
+    // set actual pixels
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width = Math.round(DESIGN_W * dpr);
+    canvas.height = Math.round(DESIGN_H * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0); // scale drawing to logical units
+    logicalWidth = DESIGN_W;
+    logicalHeight = DESIGN_H;
+  }
+
+  const ctx = canvas.getContext('2d');
+  let logicalWidth = DESIGN_W, logicalHeight = DESIGN_H;
+
+  // Game state
+  let running = false;
+  let score = 0;
+  let level = 1;
+  let lives = 3;
+  let player = { x: DESIGN_W/2 - 30, y: DESIGN_H - 80, w: 60, h: 24 };
+  let stars = [];
+  let lastSpawn = 0;
+  let spawnInterval = 900;
+  let lastTime = 0;
+  let rafId = null;
+
+  // Input
+  let pointerX = null;
+  let isTouching = false;
+
+  // Audio (WebAudio)
+  let audioCtx = null;
+  let masterGain = null;
+  let bgGain = null;
+  let bgOsc = null;
+  let activeSoundAllowed = false;
+
+  function initAudio() {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.8;
+      masterGain.connect(audioCtx.destination);
+
+      // background ambient (simple sawtooth-ish using two oscillators)
+      bgGain = audioCtx.createGain();
+      bgGain.gain.value = 0.06; // low volume
+      bgGain.connect(masterGain);
+      const o1 = audioCtx.createOscillator();
+      o1.type = 'sine';
+      o1.frequency.value = 110;
+      const o2 = audioCtx.createOscillator();
+      o2.type = 'sine';
+      o2.frequency.value = 220;
+      const mix = audioCtx.createGain();
+      mix.gain.value = 0.5;
+      o1.connect(mix);
+      o2.connect(mix);
+      mix.connect(bgGain);
+      o1.start(0);
+      o2.start(0);
+      bgOsc = { o1, o2, mix };
+
+      // reduce CPU by detuning slowly
+      let t = 0;
+      function modulate() {
+        if (!audioCtx) return;
+        t += 0.01;
+        o1.frequency.value = 110 + Math.sin(t * 0.2) * 4;
+        o2.frequency.value = 220 + Math.cos(t * 0.13) * 8;
+        if (running) requestAnimationFrame(modulate);
+      }
+      // don't start modulation until play invoked
+    } catch (e) {
+      console.warn('WebAudio not available', e);
+      audioCtx = null;
+    }
+  }
+
+  function playHit() {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const g = audioCtx.createGain();
+    g.gain.value = 0.001;
+    g.connect(masterGain);
+    const o = audioCtx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(880, now);
+    o.frequency.exponentialRampToValueAtTime(440, now + 0.12);
+    g.gain.linearRampToValueAtTime(0.12, now + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+    o.connect(g);
+    o.start(now);
+    o.stop(now + 0.14);
+  }
+
+  function playMiss() {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const g = audioCtx.createGain();
+    g.gain.value = 0.001;
+    g.connect(masterGain);
+    const o = audioCtx.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(120, now);
+    o.frequency.exponentialRampToValueAtTime(60, now + 0.25);
+    g.gain.linearRampToValueAtTime(0.08, now + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+    o.connect(g);
+    o.start(now);
+    o.stop(now + 0.28);
+  }
+
+  function playGameOver() {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const g = audioCtx.createGain();
+    g.gain.value = 0.001;
+    g.connect(masterGain);
+    const o = audioCtx.createOscillator();
+    o.type = 'square';
+    o.frequency.setValueAtTime(220, now);
+    o.frequency.exponentialRampToValueAtTime(55, now + 0.6);
+    g.gain.linearRampToValueAtTime(0.14, now + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
+    o.connect(g);
+    o.start(now);
+    o.stop(now + 0.7);
+  }
+
+  // Utilities
+  function rand(a,b){ return Math.random()*(b-a)+a; }
+
+  // Game logic
+  function spawnStar(now) {
+    const size = Math.floor(rand(10,28));
+    const x = rand(size, DESIGN_W - size);
+    const baseSpeed = 1.2 + level * 0.6;
+    const speed = baseSpeed + Math.random() * 1.6;
+    stars.push({ x, y: -size, size, speed, rotate: Math.random()*Math.PI });
+    lastSpawn = now;
+  }
+
+  function resetGame() {
+    score = 0;
+    level = 1;
+    lives = 3;
+    player.x = DESIGN_W/2 - player.w/2;
+    stars = [];
+    spawnInterval = 900;
+    lastSpawn = performance.now();
+    updateHUD();
+  }
+
+  function startGame() {
+    // ensure audioCtx created after user gesture
+    if (!audioCtx) {
+      initAudio();
+      if (audioCtx && bgGain && bgOsc) {
+        // start ambient modulation
+        requestAnimationFrame(function mod() {
+          if (!audioCtx) return;
+          bgOsc.o1.frequency.value += 0; // touch to keep reference; modulation started in initAudio when running?
+        });
+      }
+    }
+    running = true;
+    activeSoundAllowed = true;
+    resetGame();
+    overlay.style.display = 'none';
+    lastTime = performance.now();
+    if (audioCtx && bgGain) bgGain.gain.value = 0.06;
+    // start main loop
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function endGame() {
+    running = false;
+    // stop ambient slightly
+    if (bgGain) bgGain.gain.exponentialRampToValueAtTime(0.001, (audioCtx ? audioCtx.currentTime : 0) + 0.6);
+    playGameOver();
+    // high score
+    const prev = parseInt(localStorage.getItem(HIGH_SCORE_KEY) || '0', 10);
+    if (score > prev) {
+      localStorage.setItem(HIGH_SCORE_KEY, String(score));
+      highScoreText.textContent = '最高分: ' + score;
+    }
+    // show overlay
+    menuTitle.textContent = '游戏结束';
+    menuDesc.textContent = `你的分数：${score}`;
+    startBtn.textContent = '再来一局';
+    overlay.style.display = 'flex';
+  }
+
+  function updateHUD() {
+    hudScore.textContent = `分数: ${score}  等级: ${level}`;
+    heartsEl.textContent = '♥'.repeat(Math.max(0, lives));
+  }
+
+  // Render
+  function drawBackground() {
+    // gradient
+    const g = ctx.createLinearGradient(0,0,0,logicalHeight);
+    g.addColorStop(0, 'rgba(8,16,28,0.12)');
+    g.addColorStop(1, 'rgba(2,6,12,0.6)');
+    ctx.fillStyle = '#061018';
+    ctx.fillRect(0,0,logicalWidth,logicalHeight);
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,logicalWidth,logicalHeight);
+  }
+
+  function roundRect(x,y,w,h,r,fill) {
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+    if (fill) ctx.fill();
+  }
+
+  function drawPlayer() {
+    const x = player.x, y = player.y, w = player.w, h = player.h;
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(x + w/2, y + h + 8, w/1.8, 8, 0, 0, Math.PI*2);
+    ctx.fill();
+    // body
+    const bodyGrad = ctx.createLinearGradient(x,y,x,y+h);
+    bodyGrad.addColorStop(0,'#6fe0ff');
+    bodyGrad.addColorStop(1,'#2a9fbf');
+    ctx.fillStyle = bodyGrad;
+    roundRect(x,y,w,h,12,true);
+    // dome
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.beginPath();
+    ctx.ellipse(x + w/2, y - 6, w*0.35, h*0.9, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  function drawStar(s) {
+    ctx.save();
+    ctx.translate(s.x + s.size/2, s.y + s.size/2);
+    ctx.rotate(s.rotate);
+    ctx.fillStyle = 'gold';
+    const r = s.size/2;
+    ctx.beginPath();
+    for (let i=0;i<5;i++){
+      const a = (i*2)*Math.PI/5 - Math.PI/2;
+      const x = Math.cos(a)*r;
+      const y = Math.sin(a)*r;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      const a2 = ((i*2)+1)*Math.PI/5 - Math.PI/2;
+      const x2 = Math.cos(a2)*r*0.45;
+      const y2 = Math.sin(a2)*r*0.45;
+      ctx.lineTo(x2,y2);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Main update + render loop
+  function loop(now) {
+    rafId = requestAnimationFrame(loop);
+    const dt = Math.min(50, now - lastTime);
+    lastTime = now;
+    if (!running) return;
+    // spawn
+    if (now - lastSpawn > spawnInterval) spawnStar(now);
+    // update stars
+    for (let i = stars.length - 1; i >= 0; i--) {
+      const s = stars[i];
+      s.y += s.speed + level * 0.2;
+      s.rotate += 0.04;
+      // catch check
+      if (s.y + s.size >= player.y && s.y <= player.y + player.h) {
+        if (s.x + s.size > player.x && s.x < player.x + player.w) {
+          // caught
+          stars.splice(i,1);
+          score += Math.max(1, Math.floor(30 / s.size)) * level;
+          if (activeSoundAllowed) playHit();
+          if (score >= level * 1000) {
+            level++;
+            spawnInterval = Math.max(350, spawnInterval - 70);
+          }
+          continue;
+        }
+      }
+      // missed
+      if (s.y - s.size > logicalHeight) {
+        stars.splice(i,1);
+        lives--;
+        if (activeSoundAllowed) playMiss();
+        if (lives <= 0) {
+          endGame();
+          return;
+        }
+      }
+    }
+
+    // move player toward pointer if pointer present (smooth)
+    if (pointerX !== null) {
+      const targetX = pointerX - player.w/2;
+      const dx = targetX - player.x;
+      player.x += dx * 0.36; // smoothing
+      // clamp
+      if (player.x < 0) player.x = 0;
+      if (player.x + player.w > logicalWidth) player.x = logicalWidth - player.w;
+    }
+
+    // render
+    drawBackground();
+    for (const s of stars) drawStar(s);
+    drawPlayer();
+
+    // footer hint
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('触摸或鼠标移动飞碟', 8, logicalHeight - 8);
+
+    updateHUD();
+  }
+
+  // Input handlers
+  function onPointerMove(clientX) {
+    // map clientX to canvas logical coordinate
+    const rect = canvas.getBoundingClientRect();
+    const mx = (clientX - rect.left) * (logicalWidth / rect.width);
+    pointerX = Math.max(0, Math.min(logicalWidth, mx));
+  }
+
+  function onPointerUp() {
+    isTouching = false;
+    // keep pointerX defined so player can glide; if you want stop, set pointerX = null;
+  }
+
+  // Event listeners
+  canvas.addEventListener('mousemove', (e) => {
+    onPointerMove(e.clientX);
+  });
+  canvas.addEventListener('touchmove', (e) => {
+    if (e.touches && e.touches[0]) {
+      onPointerMove(e.touches[0].clientX);
+    }
+    e.preventDefault();
+  }, {passive:false});
+  canvas.addEventListener('touchstart', (e) => {
+    if (e.touches && e.touches[0]) {
+      onPointerMove(e.touches[0].clientX);
+      isTouching = true;
+    }
+    e.preventDefault();
+  }, {passive:false});
+
+  window.addEventListener('mouseup', onPointerUp);
+  window.addEventListener('touchend', onPointerUp);
+
+  // keyboard for desktop
+  window.addEventListener('keydown', (e) => {
+    if (!running && (e.key === 'Enter' || e.key === ' ')) {
+      startBtnClick();
+      return;
+    }
+    if (e.key === 'ArrowLeft' || e.key === 'a') {
+      player.x -= 14;
+      if (player.x < 0) player.x = 0;
+    } else if (e.key === 'ArrowRight' || e.key === 'd') {
+      player.x += 14;
+      if (player.x + player.w > logicalWidth) player.x = logicalWidth - player.w;
+    }
+  });
+
+  // Start button / audio enable
+  function startBtnClick() {
+    // first user gesture: resume AudioContext if needed
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(()=>{});
+    }
+    activeSoundAllowed = true;
+    if (!audioCtx) initAudio();
+    startGame();
+  }
+
+  startBtn.addEventListener('click', startBtnClick);
+
+  // High score display on load
+  function loadHighScore() {
+    const hs = parseInt(localStorage.getItem(HIGH_SCORE_KEY) || '0', 10);
+    highScoreText.textContent = '最高分: ' + hs;
+  }
+
+  // Share support
+  function tryShare() {
+    if (navigator.share) {
+      navigator.share({ title: '接住流星', text: `我在接住流星中得了 ${score} 分，快来挑战！`, url: location.href }).catch(()=>{});
+    } else {
+      // fallback: copy link
+      try {
+        navigator.clipboard.writeText(location.href);
+        alert('链接已复制到剪贴板，分享给朋友吧！');
+      } catch(e) {
+        // ignore
+      }
+    }
+  }
+
+  // Initialize sizes and initial draw
+  function initialDraw() {
+    drawBackground();
+    // sample render
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('加载完成，点击开始', 16, 40);
+  }
+
+  // Utility: clamp player within bounds
+  function clampPlayer() {
+    if (player.x < 0) player.x = 0;
+    if (player.x + player.w > logicalWidth) player.x = logicalWidth - player.w;
+  }
+
+  // On resize
+  window.addEventListener('resize', () => {
+    sizeCanvas();
+    initialDraw();
+  });
+
+  // On load setup
+  function setup() {
+    // set card width initially
+    sizeCanvas();
+    // set player y based on logical height
+    player.y = DESIGN_H - 80;
+    clampPlayer();
+    loadHighScore();
+    initialDraw();
+  }
+
+  // Start
+  setup();
+
+})();
+</script>
+</body>
+</html>
